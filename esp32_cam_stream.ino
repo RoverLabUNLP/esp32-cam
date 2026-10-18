@@ -8,23 +8,71 @@
 #include <Arduino.h>
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <WebSocketsServer.h>
 
 // ============================================================================
 // SELECCIÓN DE MODELO DE CÁMARA
 // ============================================================================
 #define CAMERA_MODEL_AI_THINKER // Placa AI-Thinker ESP32-CAM (con PSRAM)
 #include "camera_pins.h"
+#include "wifi_credentials.h"
 
 // ============================================================================
 // CREDENCIALES DE RED WI-FI
 // ============================================================================
-const char* ssid = "WIFI_DE_LA_FACU";
-const char* password = "CLAVE_DE_LA_FACU";
+
+// ============================================================================
+// SERVIDOR WEBSOCKET Y VARIABLES DE CONTROL / TELEMETRÍA
+// ============================================================================
+WebSocketsServer webSocket = WebSocketsServer(82);
+
+unsigned long lastCmdTime = 0;
+unsigned long lastTelemetryTime = 0;
+bool isMoving = false;
+
+int simDist = 20;
+int simStep = 2;
+
+// Orden de parada cinemática (v_lineal = 0, w_angular = 0)
+static const char* TWIST_STOP = "$TWIST,0.00,0.00";
 
 // Prototipos de funciones exportadas por app_httpd.cpp
 void startCameraServer();
 void setupLedFlash(int pin);
 
+// ============================================================================
+// EVENTOS WEBSOCKET
+// ============================================================================
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED: {
+      IPAddress ip = webSocket.remoteIP(num);
+      Serial.printf("[WS] Cliente #%u conectado desde %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+      lastCmdTime = millis();
+      isMoving = false;
+      break;
+    }
+
+    case WStype_DISCONNECTED:
+      Serial.printf("[WS] Cliente #%u desconectado\n", num);
+      Serial.println(TWIST_STOP);  // Failsafe: parada inmediata
+      isMoving = false;
+      break;
+
+    case WStype_TEXT:
+      lastCmdTime = millis();
+      // Reenvío transparente de la trama recibida hacia UART
+      Serial.write(payload, length);
+      Serial.println();
+      // Solo se arma el watchdog si el comando no es ya una parada
+      isMoving = !(length == strlen(TWIST_STOP) &&
+                   memcmp(payload, TWIST_STOP, length) == 0);
+      break;
+
+    default:
+      break;
+  }
+}
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
@@ -121,13 +169,61 @@ void setup() {
   Serial.print("[INFO] Flujo Directo de Video (Stream): http://");
   Serial.print(WiFi.localIP());
   Serial.println(":81/stream");
+  Serial.print("[INFO] Servidor WebSocket Control/Telemetría: ws://");
+  Serial.print(WiFi.localIP());
+  Serial.println(":82");
   Serial.println("====================================================");
+
+  // Iniciar servidor WebSocket
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  lastCmdTime = millis();
 
   // Iniciar servidor web y servidor de streaming
   startCameraServer();
 }
-
 void loop() {
-  // El servidor web, WebSocket y streaming corren en tareas FreeRTOS independientes
-  delay(10000);
+  webSocket.loop();
+
+  unsigned long now = millis();
+
+  // Generador periódico de telemetría simulada (cada 100 ms)
+  if (now - lastTelemetryTime >= 100) {
+    lastTelemetryTime = now;
+
+    // Oscilación de distancia entre 20 y 100 cm
+    simDist += simStep;
+    if (simDist >= 100) {
+      simDist = 100;
+      simStep = -2;
+    } else if (simDist <= 20) {
+      simDist = 20;
+      simStep = 2;
+    }
+
+    float bateria = 7.8f;
+    int odomL = 120;
+    int odomR = 118;
+
+    char telBuffer[64];
+
+    // $SENS,<distancia_cm>,<bateria_V>
+    snprintf(telBuffer, sizeof(telBuffer), "$SENS,%d,%.1f", simDist, bateria);
+    webSocket.broadcastTXT(telBuffer);
+
+    // $ODOM,<rueda_izq>,<rueda_der>
+    snprintf(telBuffer, sizeof(telBuffer), "$ODOM,%d,%d", odomL, odomR);
+    webSocket.broadcastTXT(telBuffer);
+
+    // $IMU,<v1>,<v2>,<v3> (valores simulados)
+    snprintf(telBuffer, sizeof(telBuffer), "$IMU,%.1f,%.1f,%.1f", 0.0f, 0.0f, 25.0f);
+    webSocket.broadcastTXT(telBuffer);
+  }
+
+  // Temporizador de seguridad (watchdog): más de 500 ms sin recibir comandos de texto
+  if (isMoving && (now - lastCmdTime > 500)) {
+    Serial.println(TWIST_STOP);  // Failsafe: parada de emergencia hacia UART
+    isMoving = false;
+  }
 }
+
