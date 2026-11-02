@@ -8,6 +8,8 @@
 #include <Arduino.h>
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <WiFiManager.h>
+#include <ESPmDNS.h>
 #include <WebSocketsServer.h>
 
 // ============================================================================
@@ -15,11 +17,35 @@
 // ============================================================================
 #define CAMERA_MODEL_AI_THINKER // Placa AI-Thinker ESP32-CAM (con PSRAM)
 #include "camera_pins.h"
-#include "wifi_credentials.h"
 
 // ============================================================================
-// CREDENCIALES DE RED WI-FI
+// UART CON LA EDU-CIAA (esquematico Rev A, hoja 2)
 // ============================================================================
+// La EDU-CIAA va por la UART2 en GPIO13 / GPIO14. La UART0 (Serial, GPIO1/3)
+// queda para programar y para los mensajes de depuracion: asi los mensajes de
+// arranque de la ESP32 y los Serial.print no le llegan a la EDU-CIAA.
+//   ESP32 GPIO13 (RX) <- RS232_TXD de la EDU-CIAA
+//   ESP32 GPIO14 (TX) -> RS232_RXD de la EDU-CIAA
+//   GND comun
+#define CIAA_RX_PIN   13
+#define CIAA_TX_PIN   14
+#define CIAA_BAUD     115200
+HardwareSerial &ciaa = Serial2;
+
+// ============================================================================
+// RED WI-FI (WiFiManager: sin credenciales en el codigo)
+// ============================================================================
+// Al arrancar intenta conectarse a la ultima red guardada. Si no puede, la
+// ESP32 crea su propia red WM_AP_NOMBRE: conectarse desde el celular o la PC,
+// se abre una pagina (o entrar a http://192.168.4.1), elegir la red y poner la
+// clave. Queda guardada en la flash de la ESP32 para los proximos arranques.
+// Para cambiar de red estando conectada: mandar "$WIFI,RESET" por el WebSocket.
+#define WM_AP_NOMBRE      "RoverCam-Config"
+#define WM_AP_CLAVE       "rover2026"   // minimo 8 caracteres
+#define WM_PORTAL_TIMEOUT 180           // s con el portal abierto; despues reinicia y reintenta
+#define WM_CONEXION_TIMEOUT 20          // s intentando la red guardada
+#define MDNS_NOMBRE       "rovercam"    // -> http://rovercam.local
+static const char* CMD_WIFI_RESET = "$WIFI,RESET";
 
 // ============================================================================
 // SERVIDOR WEBSOCKET Y VARIABLES DE CONTROL / TELEMETRÍA
@@ -55,15 +81,25 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
 
     case WStype_DISCONNECTED:
       Serial.printf("[WS] Cliente #%u desconectado\n", num);
-      Serial.println(TWIST_STOP);  // Failsafe: parada inmediata
+      ciaa.println(TWIST_STOP);  // Failsafe: parada inmediata
       isMoving = false;
       break;
 
     case WStype_TEXT:
+      // Comando propio de la ESP32 (no se reenvia a la EDU-CIAA): olvidar la red
+      if (length == strlen(CMD_WIFI_RESET) && memcmp(payload, CMD_WIFI_RESET, length) == 0) {
+        Serial.println("[WIFI] Borrando la red guardada y reiniciando en modo configuracion");
+        webSocket.sendTXT(num, "$WIFI,OK");
+        ciaa.println(TWIST_STOP);
+        delay(300);
+        WiFiManager wm;
+        wm.resetSettings();
+        ESP.restart();
+      }
       lastCmdTime = millis();
-      // Reenvío transparente de la trama recibida hacia UART
-      Serial.write(payload, length);
-      Serial.println();
+      // Reenvío transparente de la trama recibida hacia la EDU-CIAA
+      ciaa.write(payload, length);
+      ciaa.println();
       // Solo se arma el watchdog si el comando no es ya una parada
       isMoving = !(length == strlen(TWIST_STOP) &&
                    memcmp(payload, TWIST_STOP, length) == 0);
@@ -73,8 +109,28 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
       break;
   }
 }
+// Conecta a la red guardada o abre el portal de configuracion
+static void conectarWifi() {
+  WiFiManager wm;
+  wm.setTitle("Rover - ESP32-CAM");
+  wm.setConnectTimeout(WM_CONEXION_TIMEOUT);
+  wm.setConfigPortalTimeout(WM_PORTAL_TIMEOUT);
+
+  Serial.println();
+  Serial.println("[WIFI] Conectando a la red guardada...");
+  if (!wm.autoConnect(WM_AP_NOMBRE, WM_AP_CLAVE)) {
+    // Nadie configuro la red a tiempo (o la guardada no esta): se reintenta todo
+    Serial.println("[WIFI] Sin red. Reinicio para reintentar.");
+    delay(1000);
+    ESP.restart();
+  }
+  WiFi.setSleep(false);
+}
+
 void setup() {
   Serial.begin(115200);
+  ciaa.begin(CIAA_BAUD, SERIAL_8N1, CIAA_RX_PIN, CIAA_TX_PIN);
+  ciaa.println(TWIST_STOP);   // al arrancar, el auto quieto
   Serial.setDebugOutput(true);
   Serial.println();
   Serial.println("\n--- ESP32-CAM AI-Thinker CameraWebServer (OV3660) ---");
@@ -148,22 +204,19 @@ void setup() {
   setupLedFlash(LED_GPIO_NUM);
 #endif
 
-  // Conexión Wi-Fi
-  Serial.println();
-  Serial.print("[WIFI] Conectando a ");
-  Serial.println(ssid);
+  // Conexión Wi-Fi (red guardada o portal de configuración)
+  conectarWifi();
 
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  // Nombre fijo en la red local: http://rovercam.local (sin buscar la IP)
+  if (MDNS.begin(MDNS_NOMBRE)) {
+    MDNS.addService("http", "tcp", 80);
   }
 
   Serial.println();
   Serial.println("====================================================");
-  Serial.println("[WIFI] Conectado exitosamente.");
+  Serial.print("[WIFI] Conectado a ");
+  Serial.println(WiFi.SSID());
+  Serial.println("[INFO] Tambien por nombre: http://" MDNS_NOMBRE ".local");
   Serial.print("[INFO] Panel Web de Control y Video: http://");
   Serial.println(WiFi.localIP());
   Serial.print("[INFO] Flujo Directo de Video (Stream): http://");
@@ -222,7 +275,7 @@ void loop() {
 
   // Temporizador de seguridad (watchdog): más de 500 ms sin recibir comandos de texto
   if (isMoving && (now - lastCmdTime > 500)) {
-    Serial.println(TWIST_STOP);  // Failsafe: parada de emergencia hacia UART
+    ciaa.println(TWIST_STOP);  // Failsafe: parada de emergencia hacia la EDU-CIAA
     isMoving = false;
   }
 }
