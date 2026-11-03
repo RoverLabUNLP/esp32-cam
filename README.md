@@ -35,6 +35,15 @@ La comunicación con la EDU-CIAA va por la **UART2** en GPIO13 / GPIO14 (esquem�
 
 115200 bps, 8N1. En el código: `CIAA_RX_PIN`, `CIAA_TX_PIN` y `CIAA_BAUD`.
 
+**Protocolo** (tramas de texto, una por línea: `$CUERPO*HH\r\n`; el `*HH` es un checksum XOR opcional de los caracteres entre `$` y `*`):
+
+| Sentido | Trama | Qué hace la ESP32 |
+|---|---|---|
+| Web → EDU-CIAA | `$TWIST,<v>,<w>` | Solo reenvía `$TWIST` por la UART (el resto se descarta y se avisa por la consola). Manda `$TWIST,0.00,0.00` al arrancar, si se cierra la web o si pasan 500 ms sin comandos |
+| EDU-CIAA → web | `$SENS,<distancia_cm>,<bateria_V>`, `$ODOM,<izq>,<der>`, `$IMU,<v1>,<v2>,<v3>` | Descarta todo hasta un `$` (bytes basura del arranque en GPIO14) y reenvía la línea al WebSocket |
+
+Con `TELEMETRY_SIMULATED 1` vuelve la telemetría simulada (para probar la web sin la EDU-CIAA).
+
 No conectar a nada IO0, IO2, IO12 ni IO15: definen cómo arranca la ESP32 (con IO12 en alto al encender, no bootea).
 
 ## Configurar la red Wi-Fi (sin tocar el código)
