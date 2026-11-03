@@ -27,10 +27,18 @@
 //   ESP32 GPIO13 (RX) <- RS232_TXD de la EDU-CIAA
 //   ESP32 GPIO14 (TX) -> RS232_RXD de la EDU-CIAA
 //   GND comun
+// GPIO13/14 son tambien pines del slot microSD: no usar la SD con esta UART.
+//
+// Regla: SOLO sendTwistToCIAA() escribe en SerialCIAA y SOLO pollCIAA() lee.
+// Todo log de depuracion va por Serial (UART0).
+#define CIAA_UART_NUM 2
 #define CIAA_RX_PIN   13
 #define CIAA_TX_PIN   14
 #define CIAA_BAUD     115200
-HardwareSerial &ciaa = Serial2;
+HardwareSerial SerialCIAA(CIAA_UART_NUM);
+
+// Poner en 1 para generar telemetria simulada (pruebas sin EDU-CIAA conectada)
+#define TELEMETRY_SIMULATED 0
 
 // ============================================================================
 // RED WI-FI (WiFiManager: sin credenciales en el codigo)
@@ -53,18 +61,98 @@ static const char* CMD_WIFI_RESET = "$WIFI,RESET";
 WebSocketsServer webSocket = WebSocketsServer(82);
 
 unsigned long lastCmdTime = 0;
-unsigned long lastTelemetryTime = 0;
 bool isMoving = false;
 
+#if TELEMETRY_SIMULATED
+unsigned long lastTelemetryTime = 0;
 int simDist = 20;
 int simStep = 2;
+#endif
+
+// Búfer de recepción de tramas de telemetría desde la EDU-CIAA
+static const size_t CIAA_RX_BUF_SIZE = 128;
+static char   ciaaRxBuf[CIAA_RX_BUF_SIZE];
+static size_t ciaaRxLen = 0;
+static bool   ciaaRxOverflow = false;
 
 // Orden de parada cinemática (v_lineal = 0, w_angular = 0)
-static const char* TWIST_STOP = "$TWIST,0.00,0.00";
+static const char* TWIST_STOP   = "$TWIST,0.00,0.00";
+static const char* TWIST_PREFIX = "$TWIST,";
 
 // Prototipos de funciones exportadas por app_httpd.cpp
 void startCameraServer();
 void setupLedFlash(int pin);
+
+// ============================================================================
+// ENVÍO DE COMANDOS HACIA LA EDU-CIAA (único punto de escritura en SerialCIAA)
+// ============================================================================
+// Envía una trama $TWIST terminada en '\n'. Cualquier otra trama se descarta y
+// se reporta por la consola de depuración, manteniendo la UART2 limpia.
+static bool sendTwistToCIAA(const uint8_t* data, size_t len) {
+  const size_t prefixLen = strlen(TWIST_PREFIX);
+  if (len < prefixLen || memcmp(data, TWIST_PREFIX, prefixLen) != 0) {
+    Serial.printf("[CIAA] Trama rechazada (no es $TWIST): %.*s\n", (int)len, (const char*)data);
+    return false;
+  }
+
+  SerialCIAA.write(data, len);
+  SerialCIAA.write('\n');
+  return true;
+}
+
+static inline void sendStopToCIAA() {
+  sendTwistToCIAA((const uint8_t*)TWIST_STOP, strlen(TWIST_STOP));
+}
+
+// ============================================================================
+// RECEPCIÓN Y PARSEO DE TELEMETRÍA DESDE LA EDU-CIAA
+// ============================================================================
+static void handleCIAAFrame(char* line, size_t len) {
+  if (len == 0) return;
+
+  if (strncmp(line, "$SENS,", 6) == 0 ||
+      strncmp(line, "$ODOM,", 6) == 0 ||
+      strncmp(line, "$IMU,", 5) == 0) {
+    webSocket.broadcastTXT(line, len);
+  } else {
+    Serial.printf("[CIAA] Trama desconocida: %s\n", line);
+  }
+}
+
+static void pollCIAA() {
+  while (SerialCIAA.available() > 0) {
+    int c = SerialCIAA.read();
+    if (c < 0) break;
+
+    if (c == '\n') {
+      if (ciaaRxOverflow) {
+        Serial.println("[CIAA] Trama descartada por exceso de longitud");
+      } else {
+        // Quitar '\r' final si la EDU-CIAA envía CRLF
+        if (ciaaRxLen > 0 && ciaaRxBuf[ciaaRxLen - 1] == '\r') ciaaRxLen--;
+        ciaaRxBuf[ciaaRxLen] = '\0';
+        handleCIAAFrame(ciaaRxBuf, ciaaRxLen);
+      }
+      ciaaRxLen = 0;
+      ciaaRxOverflow = false;
+      continue;
+    }
+
+    if (c == '$') {
+      // Inicio de trama: resincroniza aunque la anterior haya quedado incompleta
+      ciaaRxLen = 0;
+      ciaaRxOverflow = false;
+    }
+
+    if (ciaaRxOverflow) continue;
+
+    if (ciaaRxLen < CIAA_RX_BUF_SIZE - 1) {
+      ciaaRxBuf[ciaaRxLen++] = (char)c;
+    } else {
+      ciaaRxOverflow = true;
+    }
+  }
+}
 
 // ============================================================================
 // EVENTOS WEBSOCKET
@@ -81,29 +169,36 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
 
     case WStype_DISCONNECTED:
       Serial.printf("[WS] Cliente #%u desconectado\n", num);
-      ciaa.println(TWIST_STOP);  // Failsafe: parada inmediata
+      sendStopToCIAA();  // Failsafe: parada inmediata
       isMoving = false;
       break;
 
-    case WStype_TEXT:
+    case WStype_TEXT: {
+      // Eliminar terminadores de línea que pudiera traer el cliente
+      size_t len = length;
+      while (len > 0 && (payload[len - 1] == '\n' || payload[len - 1] == '\r')) {
+        len--;
+      }
+
       // Comando propio de la ESP32 (no se reenvia a la EDU-CIAA): olvidar la red
-      if (length == strlen(CMD_WIFI_RESET) && memcmp(payload, CMD_WIFI_RESET, length) == 0) {
+      if (len == strlen(CMD_WIFI_RESET) && memcmp(payload, CMD_WIFI_RESET, len) == 0) {
         Serial.println("[WIFI] Borrando la red guardada y reiniciando en modo configuracion");
         webSocket.sendTXT(num, "$WIFI,OK");
-        ciaa.println(TWIST_STOP);
+        sendStopToCIAA();
         delay(300);
         WiFiManager wm;
         wm.resetSettings();
         ESP.restart();
       }
       lastCmdTime = millis();
-      // Reenvío transparente de la trama recibida hacia la EDU-CIAA
-      ciaa.write(payload, length);
-      ciaa.println();
-      // Solo se arma el watchdog si el comando no es ya una parada
-      isMoving = !(length == strlen(TWIST_STOP) &&
-                   memcmp(payload, TWIST_STOP, length) == 0);
+      // Reenvío de la trama $TWIST recibida hacia la EDU-CIAA (UART2)
+      if (sendTwistToCIAA(payload, len)) {
+        // Solo se arma el watchdog si el comando no es ya una parada
+        isMoving = !(len == strlen(TWIST_STOP) &&
+                     memcmp(payload, TWIST_STOP, len) == 0);
+      }
       break;
+    }
 
     default:
       break;
@@ -128,12 +223,18 @@ static void conectarWifi() {
 }
 
 void setup() {
+  // UART0: depuracion / consola USB hacia la PC (los logs del core ESP32 van aqui)
   Serial.begin(115200);
-  ciaa.begin(CIAA_BAUD, SERIAL_8N1, CIAA_RX_PIN, CIAA_TX_PIN);
-  ciaa.println(TWIST_STOP);   // al arrancar, el auto quieto
   Serial.setDebugOutput(true);
+
+  // UART2: canal dedicado a la EDU-CIAA (8N1, RX=GPIO13, TX=GPIO14)
+  SerialCIAA.begin(CIAA_BAUD, SERIAL_8N1, CIAA_RX_PIN, CIAA_TX_PIN);
+  sendStopToCIAA();   // al arrancar, el auto quieto
+
   Serial.println();
   Serial.println("\n--- ESP32-CAM AI-Thinker CameraWebServer (OV3660) ---");
+  Serial.printf("[CIAA] UART%d iniciada a %d baudios (RX=GPIO%d, TX=GPIO%d)\n",
+                CIAA_UART_NUM, CIAA_BAUD, CIAA_RX_PIN, CIAA_TX_PIN);
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -238,8 +339,12 @@ void setup() {
 void loop() {
   webSocket.loop();
 
+  // Recepción y reenvío de telemetría real desde la EDU-CIAA ($SENS/$ODOM/$IMU)
+  pollCIAA();
+
   unsigned long now = millis();
 
+#if TELEMETRY_SIMULATED
   // Generador periódico de telemetría simulada (cada 100 ms)
   if (now - lastTelemetryTime >= 100) {
     lastTelemetryTime = now;
@@ -272,11 +377,12 @@ void loop() {
     snprintf(telBuffer, sizeof(telBuffer), "$IMU,%.1f,%.1f,%.1f", 0.0f, 0.0f, 25.0f);
     webSocket.broadcastTXT(telBuffer);
   }
+#endif
 
   // Temporizador de seguridad (watchdog): más de 500 ms sin recibir comandos de texto
   if (isMoving && (now - lastCmdTime > 500)) {
-    ciaa.println(TWIST_STOP);  // Failsafe: parada de emergencia hacia la EDU-CIAA
+    sendStopToCIAA();  // Failsafe: parada de emergencia hacia la EDU-CIAA
+    Serial.println("[WDT] Sin comandos > 500 ms: parada enviada a la EDU-CIAA");
     isMoving = false;
   }
 }
-
